@@ -26,29 +26,33 @@
   .dot { width:9px; height:9px; border-radius:50%; background:#555; flex-shrink:0; }
   .dot.on { background:var(--ok); box-shadow:0 0 6px var(--ok); }
   .dot.err { background:var(--err); }
-  .log { background:#0a0c10; border:1px solid var(--line); border-radius:8px; padding:12px; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; line-height:1.55; white-space:pre-wrap; word-break:break-word; max-height:340px; overflow-y:auto; color:#c8cedb; min-height:60px; }
+  .log { background:#0a0c10; border:1px solid var(--line); border-radius:8px; padding:12px; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; line-height:1.55; white-space:pre-wrap; word-break:break-word; max-height:360px; overflow-y:auto; color:#c8cedb; min-height:60px; }
   .hint { color:var(--dim); font-size:12px; margin-top:10px; line-height:1.5; }
+  details summary { cursor:pointer; font-size:12px; color:var(--dim); margin-top:8px; }
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
     <h1>Fo MCP Test Page</h1>
-    <div class="sub">Simple client: Fo ke MCP endpoint se connect karke tools test karo</div>
+    <div class="sub">Fo ko kisi doosri app se test karo: Connect dabao, Wajo sign-in khulega</div>
   </header>
 
   <div class="card">
     <h2>Connection</h2>
     <label for="url">MCP Endpoint URL</label>
-    <input id="url" placeholder="https://example.com/mcp" spellcheck="false">
-    <label for="tok">Token / API key (sirf tumhare browser me save hota hai)</label>
-    <input id="tok" type="password" placeholder="token" spellcheck="false">
+    <input id="url" placeholder="https://mcp.api.wajo.ai/fo" spellcheck="false">
     <div class="row">
-      <button id="btnConnect">Connect</button>
-      <button class="sec" id="btnClear">Clear saved</button>
+      <button id="btnConnect">Connect (Sign in with Wajo)</button>
+      <button class="sec" id="btnLogout">Sign out</button>
     </div>
+    <details><summary>Manual token (agar kabhi bearer token ho to)</summary>
+      <label for="tok">Bearer token (optional)</label>
+      <input id="tok" type="password" placeholder="token" spellcheck="false">
+      <div class="row"><button class="sec" id="btnTokConnect">Connect with token</button></div>
+    </details>
     <div class="status"><span class="dot" id="dot"></span><span id="stat">Not connected</span></div>
-    <div class="hint">URL aur token Wajo Settings se milte hain. Token kahin upload nahi hota, sirf localStorage me rehta hai.</div>
+    <div class="hint">Sign-in token sirf tumhare browser me save hota hai, kahin upload nahi hota.</div>
   </div>
 
   <div class="card">
@@ -75,32 +79,150 @@
 (function(){
   const $ = id => document.getElementById(id);
   let sessionId = null, nextId = 1, connected = false;
-  const log = (txt, cls) => {
+  const DEF_URL = "https://mcp.api.wajo.ai/fo";
+  const LS_AUTH = "fomcp_oauth", LS_FLOW = "fomcp_flow";
+
+  const log = (txt) => {
     const el = $('log');
     const t = new Date().toLocaleTimeString();
-    el.textContent += (el.textContent ? "\n" : "") + "[" + t + "] " + txt;
+    el.textContent += (el.textContent && el.textContent !== "Ready." ? "\n" : "") + "[" + t + "] " + txt;
     el.scrollTop = el.scrollHeight;
   };
-  const load = () => {
+
+  const b64url = buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
+  async function pkce() {
+    const bytes = new Uint8Array(32); crypto.getRandomValues(bytes);
+    const verifier = b64url(bytes.buffer);
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+    return { verifier, challenge: b64url(digest) };
+  }
+
+  const stored = () => { try { return JSON.parse(localStorage.getItem(LS_AUTH) || "null"); } catch(e){ return null; } };
+  const saveAuth = t => localStorage.setItem(LS_AUTH, JSON.stringify(t));
+  const getTok = () => {
+    const t = stored();
+    if (t && t.access_token) return t.access_token;
+    const m = $('tok').value.trim();
+    return m || null;
+  };
+
+  const REDIRECT = location.origin + location.pathname;
+
+  async function jget(url) {
+    const r = await fetch(url, { headers: { "Accept":"application/json" } });
+    if (!r.ok) throw new Error("HTTP " + r.status + " @ " + url);
+    return r.json();
+  }
+
+  async function discover() {
+    const u = new URL($('url').value.trim());
+    const origin = u.origin, path = u.pathname;
+    const cands = [
+      origin + "/.well-known/oauth-protected-resource",
+      origin + path + "/.well-known/oauth-protected-resource"
+    ];
+    for (const c of cands) {
+      try {
+        const meta = await jget(c);
+        if (meta && (meta.authorization_servers || meta.authorization_server)) {
+          log("Resource metadata mila: " + c);
+          const asList = meta.authorization_servers || [meta.authorization_server];
+          return asList[0];
+        }
+      } catch(e){}
+    }
+    log("Protected-resource metadata nahi mila, seedha AS metadata try kar rahi hoon.");
+    return origin;
+  }
+
+  async function asMeta(base) {
+    const cands = [
+      base + "/.well-known/oauth-authorization-server",
+      base + "/.well-known/openid-configuration"
+    ];
+    for (const c of cands) {
+      try {
+        const m = await jget(c);
+        if (m && m.authorization_endpoint && m.token_endpoint) { log("Auth server metadata mila: " + c); return m; }
+      } catch(e){}
+    }
+    throw new Error("Authorization server metadata nahi mila (" + base + ")");
+  }
+
+  async function registerClient(m) {
+    if (!m.registration_endpoint) throw new Error("Dynamic client registration supported nahi hai (registration_endpoint nahi mila).");
+    const r = await fetch(m.registration_endpoint, {
+      method: "POST",
+      headers: { "Content-Type":"application/json", "Accept":"application/json" },
+      body: JSON.stringify({
+        client_name: "Fo MCP Test Page",
+        redirect_uris: [REDIRECT],
+        grant_types: ["authorization_code"],
+        response_types: ["code"],
+        token_endpoint_auth_method: "none"
+      })
+    });
+    if (!r.ok) throw new Error("Client registration fail: HTTP " + r.status);
+    const j = await r.json();
+    log("Client registered: " + (j.client_id || "").slice(0, 12) + "…");
+    return j.client_id;
+  }
+
+  async function startOauth() {
     try {
-      const s = JSON.parse(localStorage.getItem("fomcp") || "{}");
-      if (s.url) $('url').value = s.url;
-      if (s.tok) $('tok').value = s.tok;
-    } catch(e){}
-  };
-  const save = () => {
-    localStorage.setItem("fomcp", JSON.stringify({url:$('url').value.trim(), tok:$('tok').value}));
-  };
-  $('btnClear').onclick = () => { localStorage.removeItem("fomcp"); $('url').value=""; $('tok').value=""; log("Saved URL/token cleared."); };
+      const asBase = await discover();
+      const m = await asMeta(asBase);
+      const clientId = await registerClient(m);
+      const { verifier, challenge } = await pkce();
+      const state = b64url(crypto.getRandomValues(new Uint8Array(12)).buffer);
+      localStorage.setItem(LS_FLOW, JSON.stringify({ verifier, state, clientId, tokenEndpoint: m.token_endpoint }));
+      const scope = (m.scopes_supported && m.scopes_supported.length) ? m.scopes_supported.join(" ") : "";
+      const q = new URLSearchParams({
+        response_type: "code",
+        client_id: clientId,
+        redirect_uri: REDIRECT,
+        state,
+        code_challenge: challenge,
+        code_challenge_method: "S256"
+      });
+      if (scope) q.set("scope", scope);
+      location.href = m.authorization_endpoint + "?" + q.toString();
+    } catch(e) {
+      log("Sign-in start nahi hua: " + e.message);
+      if (e.message === "Failed to fetch") log("Possible reason: browser ne request block ki (CORS). Log me sab steps hain.");
+      $('stat').textContent = "Failed"; $('dot').className = "dot err";
+    }
+  }
+
+  async function finishOauth(code, state) {
+    let flow;
+    try { flow = JSON.parse(localStorage.getItem(LS_FLOW) || "null"); } catch(e){}
+    if (!flow) { log("Sign-in state nahi mila, dobara Connect dabao."); return; }
+    if (state !== flow.state) { log("State mismatch, sign-in cancel."); localStorage.removeItem(LS_FLOW); return; }
+    try {
+      const body = new URLSearchParams({
+        grant_type: "authorization_code",
+        code, redirect_uri: REDIRECT, client_id: flow.clientId, code_verifier: flow.verifier
+      });
+      const r = await fetch(flow.tokenEndpoint, { method:"POST", headers:{ "Content-Type":"application/x-www-form-urlencoded", "Accept":"application/json" }, body });
+      if (!r.ok) throw new Error("Token exchange fail: HTTP " + r.status);
+      const j = await r.json();
+      saveAuth({ access_token: j.access_token, token_type: j.token_type || "Bearer" });
+      localStorage.removeItem(LS_FLOW);
+      history.replaceState(null, "", REDIRECT);
+      log("Sign-in ho gaya, ab connect karte hain.");
+      await doConnect();
+    } catch(e) {
+      log("Token exchange fail: " + e.message);
+      $('stat').textContent = "Failed"; $('dot').className = "dot err";
+    }
+  }
 
   async function rpc(method, params, notify) {
     const body = { jsonrpc:"2.0", method, params: params || {} };
     if (!notify) body.id = nextId++;
-    const headers = {
-      "Content-Type":"application/json",
-      "Accept":"application/json, text/event-stream"
-    };
-    const tok = $('tok').value.trim();
+    const headers = { "Content-Type":"application/json", "Accept":"application/json, text/event-stream" };
+    const tok = getTok();
     if (tok) headers["Authorization"] = "Bearer " + tok;
     if (sessionId) headers["Mcp-Session-Id"] = sessionId;
     const res = await fetch($('url').value.trim(), { method:"POST", headers, body: JSON.stringify(body) });
@@ -108,6 +230,11 @@
     if (sid) sessionId = sid;
     if (res.status === 202) return null;
     const ct = (res.headers.get("content-type") || "");
+    if (res.status === 401) {
+      connected = false;
+      localStorage.removeItem(LS_AUTH);
+      throw new Error("401: token expire/cancel hua. Dobara Connect dabao.");
+    }
     if (!res.ok) {
       let msg = "HTTP " + res.status;
       try { const j = await res.json(); msg += ": " + (j.error && j.error.message ? j.error.message : JSON.stringify(j)); } catch(e){}
@@ -117,8 +244,8 @@
       const text = await res.text();
       let out = null;
       for (const line of text.split("\n")) {
-        const m = line.match(/^data:\s*(.+)$/);
-        if (m) { try { out = JSON.parse(m[1]); } catch(e){} }
+        const mm = line.match(/^data:\s*(.+)$/);
+        if (mm) { try { out = JSON.parse(mm[1]); } catch(e){} }
       }
       return out;
     }
@@ -142,29 +269,48 @@
     log("Tools mile: " + tools.length + " (" + tools.map(t=>t.name).join(", ") + ")");
   }
 
+  async function doConnect() {
+    sessionId = null;
+    const r = await rpc("initialize", {
+      protocolVersion: "2025-03-26",
+      capabilities: {},
+      clientInfo: { name:"fo-mcp-test", version:"1.1" }
+    });
+    log("Initialize OK. Server: " + (r && r.serverInfo ? (r.serverInfo.name + " " + (r.serverInfo.version||"")) : "(no info)"));
+    try { await rpc("notifications/initialized", {}, true); } catch(e){}
+    await listTools();
+    connected = true;
+    $('stat').textContent = "Connected"; $('dot').className = "dot on";
+  }
+
   $('btnConnect').onclick = async () => {
-    if (!$('url').value.trim()) { log("Pehle endpoint URL daalo."); return; }
-    $('btnConnect').disabled = true;
-    $('stat').textContent = "Connecting…"; $('dot').className = "dot";
-    save();
-    try {
-      sessionId = null;
-      const r = await rpc("initialize", {
-        protocolVersion: "2025-03-26",
-        capabilities: {},
-        clientInfo: { name:"fo-mcp-test", version:"1.0" }
-      });
-      log("Initialize OK. Server: " + (r && r.serverInfo ? (r.serverInfo.name + " " + (r.serverInfo.version||"")) : "(no info)"));
-      await rpc("notifications/initialized", {}, true).catch(e=>log("init notification: " + e.message));
-      await listTools();
-      connected = true;
-      $('stat').textContent = "Connected"; $('dot').className = "dot on";
-    } catch(e) {
-      $('stat').textContent = "Failed"; $('dot').className = "dot err";
-      log("Connect fail: " + e.message);
-      if (e.message === "Failed to fetch") log("Possible reason: CORS ya URL galat. Browser se cross-origin call block ho sakta hai.");
+    if (!$('url').value.trim()) $('url').value = DEF_URL;
+    localStorage.setItem("fomcp_url", $('url').value.trim());
+    if (getTok()) {
+      $('btnConnect').disabled = true;
+      $('stat').textContent = "Connecting…"; $('dot').className = "dot";
+      try { await doConnect(); } catch(e) {
+        $('stat').textContent = "Failed"; $('dot').className = "dot err";
+        log("Connect fail: " + e.message);
+        if (e.message === "Failed to fetch") log("Possible reason: browser ne call block ki (CORS).");
+      }
+      $('btnConnect').disabled = false;
+    } else {
+      $('stat').textContent = "Sign-in khul raha hai…"; $('dot').className = "dot";
+      log("Wajo sign-in start ho raha hai…");
+      startOauth();
     }
-    $('btnConnect').disabled = false;
+  };
+
+  $('btnTokConnect').onclick = () => $('btnConnect').onclick();
+
+  $('btnLogout').onclick = () => {
+    localStorage.removeItem(LS_AUTH);
+    localStorage.removeItem(LS_FLOW);
+    connected = false; sessionId = null;
+    $('stat').textContent = "Not connected"; $('dot').className = "dot";
+    $('tool').innerHTML = '<option value="">Connect karke list aayegi</option>';
+    log("Sign out ho gaya, token browser se delete.");
   };
 
   $('btnList').onclick = async () => {
@@ -190,7 +336,18 @@
     $('btnRun').disabled = false;
   };
 
-  load();
+  // init
+  $('url').value = localStorage.getItem("fomcp_url") || DEF_URL;
+  const qs = new URLSearchParams(location.search);
+  if (qs.get("code")) {
+    log("Sign-in se wapas aa gaye, token le rahi hoon…");
+    finishOauth(qs.get("code"), qs.get("state"));
+  } else if (qs.get("error")) {
+    log("Sign-in me error aaya: " + qs.get("error"));
+    history.replaceState(null, "", REDIRECT);
+  } else if (getTok()) {
+    $('stat').textContent = "Token saved, Connect dabao"; $('dot').className = "dot on";
+  }
 })();
 </script>
 </body>
